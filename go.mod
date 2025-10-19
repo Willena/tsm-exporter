@@ -3,6 +3,7 @@ module github.com/willena/tsm-exporter
 go 1.23.0
 
 require (
+	github.com/apache/arrow/go/arrow v0.0.0-20211112161151-bc219186db40
 	github.com/influxdata/influxdb/v2 v2.7.12
 	github.com/xitongsys/parquet-go v1.6.2
 	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b
@@ -16,7 +17,6 @@ require (
 	github.com/RoaringBitmap/roaring v0.4.16 // indirect
 	github.com/aokoli/goutils v1.0.1 // indirect
 	github.com/apache/arrow-go/v18 v18.2.0 // indirect
-	github.com/apache/arrow/go/arrow v0.0.0-20211112161151-bc219186db40 // indirect
 	github.com/apache/arrow/go/v7 v7.0.1 // indirect
 	github.com/apache/thrift v0.21.0 // indirect
 	github.com/benbjohnson/immutable v0.4.3 // indirect

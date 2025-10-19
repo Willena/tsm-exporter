@@ -2,7 +2,7 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -15,7 +15,8 @@ import (
 
 	"github.com/influxdata/influxdb/v2/tsdb/engine/tsm1"
 	"github.com/xitongsys/parquet-go-source/local"
-	parquet "github.com/xitongsys/parquet-go/parquet"
+	"github.com/xitongsys/parquet-go/parquet"
+	"github.com/xitongsys/parquet-go/source"
 	parquetWritter "github.com/xitongsys/parquet-go/writer"
 )
 
@@ -176,9 +177,6 @@ func discoverSchemaFromTSMFile(path string) error {
 	iter := r.BlockIterator()
 	for iter.Next() {
 		keyByte := iter.PeekNext()
-		if "" == string(keyByte) {
-			// Empty should not go here .
-		}
 		serieKey, fieldKey := tsm1.SeriesAndFieldFromCompositeKey(keyByte)
 		fieldString := string(fieldKey)
 		measurement, tags := parseSeriesKey(string(serieKey))
@@ -229,44 +227,59 @@ func discoverSchemaFromTSMFile(path string) error {
 
 // ---------- Build Parquet schema (Parquet thrift/JSON schema string) ----------
 func buildParquetSchema(ms *MeasurementSchema) string {
-	// We'll create a Parquet message with:
-	// required INT64 timestamp (millis), then optional tag columns (UTF8), then optional fields with inferred types.
-	// JSON writer expects a "message" style schema.
-	var b bytes.Buffer
-	b.WriteString("message m {\n")
-	b.WriteString("  required int64 timestamp; \n")
-	// tags (optional UTF8)
+	var fields []map[string]interface{}
+
+	// timestamp column
+	fields = append(fields, map[string]interface{}{
+		"Tag": "name=timestamp, type=INT64, convertedtype=TIMESTAMP_MILLIS, repetitiontype=REQUIRED",
+	})
+
+	// tags as optional UTF8 strings
 	tagList := make([]string, 0, len(ms.TagKeys))
 	for k := range ms.TagKeys {
 		tagList = append(tagList, k)
 	}
 	sort.Strings(tagList)
 	for _, k := range tagList {
-		safe := parquetColName(k)
-		b.WriteString(fmt.Sprintf("  optional binary %s (UTF8);\n", safe))
+		fields = append(fields, map[string]interface{}{
+			"Tag": fmt.Sprintf("name=%s, type=BYTE_ARRAY, convertedtype=UTF8, repetitiontype=OPTIONAL", parquetColName(k)),
+		})
 	}
-	// fields
+
 	fieldList := make([]string, 0, len(ms.FieldKeys))
 	for k := range ms.FieldKeys {
 		fieldList = append(fieldList, k)
 	}
 	sort.Strings(fieldList)
+	// fields with proper type mapping
 	for _, k := range fieldList {
-		t := ms.FieldKeys[k]
-		safe := parquetColName(k)
-		switch t {
+		colName := parquetColName(k)
+		ft := ms.FieldKeys[k]
+
+		var tag string
+		switch ft {
 		case TypeInt64:
-			b.WriteString(fmt.Sprintf("  optional int64 %s;\n", safe))
+			tag = fmt.Sprintf("name=%s, type=INT64, repetitiontype=OPTIONAL", colName)
 		case TypeDouble:
-			b.WriteString(fmt.Sprintf("  optional double %s;\n", safe))
+			tag = fmt.Sprintf("name=%s, type=DOUBLE, repetitiontype=OPTIONAL", colName)
 		case TypeBool:
-			b.WriteString(fmt.Sprintf("  optional boolean %s;\n", safe))
+			tag = fmt.Sprintf("name=%s, type=BOOLEAN, repetitiontype=OPTIONAL", colName)
 		default:
-			b.WriteString(fmt.Sprintf("  optional binary %s (UTF8);\n", safe))
+			tag = fmt.Sprintf("name=%s, type=BYTE_ARRAY, convertedtype=UTF8, repetitiontype=OPTIONAL", colName)
 		}
+
+		fields = append(fields, map[string]interface{}{"Tag": tag})
 	}
-	b.WriteString("}\n")
-	return b.String()
+
+	// the JSONWriter expects this shape:
+	// {"Tag":"name=parquet-go-root","Fields":[ {...}, {...}, ... ]}
+	root := map[string]interface{}{
+		"Tag":    "name=parquet-go-root",
+		"Fields": fields,
+	}
+
+	jsonBytes, _ := json.Marshal(root)
+	return string(jsonBytes)
 }
 
 // safe column name: replace non-word chars with underscore
@@ -303,12 +316,12 @@ type measurementWriter struct {
 	fileIdx int64
 
 	// parquet objects
-	pw   *parquetWritter.JSONWriter
-	fw   *local.LocalFile
+	pw   *parquetWritter.ParquetWriter
+	fw   source.ParquetFile
 	lock sync.Mutex
 }
 
-func newMeasurementWriter(measurement, schemaStr, outDir string, maxRows int64) *measurementWriter {
+func newMeasurementWriter(measurement string, schemaStr string, outDir string, maxRows int64) *measurementWriter {
 	mw := &measurementWriter{
 		measurement: measurement,
 		schemaStr:   schemaStr,
@@ -347,12 +360,14 @@ func (mw *measurementWriter) rotate() error {
 	fileName := fmt.Sprintf("%s_%06d.parquet", sanitizeFileName(mw.measurement), mw.fileIdx)
 	full := filepath.Join(mw.outDir, fileName)
 
-	fw := &local.LocalFile{}
-	_, err := fw.Create(full)
+	fw, err := local.NewLocalFileWriter(full)
 	if err != nil {
 		return err
 	}
-	pw, err := parquetWritter.NewJSONWriter(mw.schemaStr, fw, 4)
+	println("Creating new JSONWriter")
+	println("Schema is", mw.schemaStr)
+
+	pw, err := parquetWritter.NewParquetWriter(fw, mw.schemaStr, 4)
 	if err != nil {
 		_ = fw.Close()
 		return err
@@ -394,8 +409,11 @@ func (mw *measurementWriter) run() {
 			if mw.pw == nil {
 				_ = mw.rotate()
 			}
+
 			if err := mw.pw.Write(msg.row); err != nil {
 				log.Printf("parquet write error for %s: %v", mw.measurement, err)
+				log.Printf("Data was %v", msg.row)
+				log.Fatalf("Stop here !")
 			} else {
 				mw.curRows++
 				if mw.curRows >= mw.maxRows {
