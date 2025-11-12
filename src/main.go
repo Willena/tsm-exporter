@@ -247,6 +247,8 @@ func discoverSchema(ctx context.Context, tsmDir string, includeMeasurements map[
 	}
 
 	fileCh := make(chan string, len(files))
+	log.Printf("Found %d tsm files \n", len(files))
+
 	for _, f := range files {
 		fileCh <- f
 	}
@@ -298,6 +300,7 @@ func parseSeriesKey(k string) (measurement string, tags map[string]string) {
 
 func inspectTSMFileForSchema(filename string, schema *Schema, includeMeasurements map[string]struct{}, start, end *time.Time) error {
 	f, err := os.Open(filename)
+	log.Printf("Inspecting %s \n", filename)
 	if err != nil {
 		return err
 	}
