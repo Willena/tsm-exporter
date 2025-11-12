@@ -2,128 +2,284 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/schollz/progressbar/v3"
+
 	"github.com/influxdata/influxdb/v2/tsdb/engine/tsm1"
-	"github.com/xitongsys/parquet-go-source/local"
-	"github.com/xitongsys/parquet-go/parquet"
-	"github.com/xitongsys/parquet-go/source"
-	parquetWritter "github.com/xitongsys/parquet-go/writer"
 )
 
-// ---------- Config ----------
-var (
-	MaxRowsPerFile  = int64(5_000_000) // rotate after this many rows per measurement file (tune for your environment)
-	WriterQueueLen  = 1000             // per-measurement queue to smooth bursts
-	ParallelReaders = 8                // number of goroutines reading TSM files concurrently
-)
+////////////////////////////////////////////////////////////////////////////////
+// Types and constants
+////////////////////////////////////////////////////////////////////////////////
 
-// ---------- Type helpers for schema inference ----------
 type FieldType int
 
 const (
-	TypeUnknown FieldType = iota
-	TypeInt64
-	TypeDouble
-	TypeBool
-	TypeString
+	FieldInt FieldType = iota
+	FieldFloat
+	FieldString
+	FieldBool
 )
 
-func (t FieldType) String() string {
-	switch t {
-	case TypeInt64:
-		return "INT64"
-	case TypeDouble:
-		return "DOUBLE"
-	case TypeBool:
-		return "BOOLEAN"
+func (ft FieldType) Suffix() string {
+	switch ft {
+	case FieldInt:
+		return "_i64"
+	case FieldFloat:
+		return "_f64"
+	case FieldString:
+		return "_str"
+	case FieldBool:
+		return "_bool"
 	default:
-		return "UTF8"
+		return "_str"
 	}
 }
 
-// choose a field type promotion rule: if mixed numeric & float -> DOUBLE, mixed anything else -> UTF8
-func promote(a, b FieldType) FieldType {
-	if a == b {
-		return a
+func sqlTypeForField(ft FieldType) string {
+	switch ft {
+	case FieldInt:
+		return "INTEGER"
+	case FieldFloat:
+		return "REAL"
+	case FieldString:
+		return "TEXT"
+	case FieldBool:
+		return "INTEGER"
+	default:
+		return "TEXT"
 	}
-	if a == TypeUnknown {
-		return b
-	}
-	if b == TypeUnknown {
-		return a
-	}
-	// int64 + double => double
-	if (a == TypeInt64 && b == TypeDouble) || (a == TypeDouble && b == TypeInt64) {
-		return TypeDouble
-	}
-	// anything else becomes string
-	return TypeString
 }
-
-// ---------- Structures to hold schema info ----------
 
 type MeasurementSchema struct {
-	Measurement string
-	// tag keys (strings)
-	TagKeys map[string]struct{}
-	// field keys and inferred type
-	FieldKeys map[string]FieldType
-
-	mu sync.Mutex
+	FieldTypes map[string]FieldType // field key -> chosen type
+	TagKeys    map[string]struct{}  // tag key set for the measurement
 }
 
-func NewMeasurementSchema(name string) *MeasurementSchema {
-	return &MeasurementSchema{
-		Measurement: name,
-		TagKeys:     make(map[string]struct{}),
-		FieldKeys:   make(map[string]FieldType),
+type Schema struct {
+	Measurements map[string]*MeasurementSchema
+	TagKeys      map[string]struct{} // global union of tag keys
+}
+
+func NewSchema() *Schema {
+	return &Schema{
+		Measurements: make(map[string]*MeasurementSchema),
+		TagKeys:      make(map[string]struct{}),
 	}
 }
 
-func (ms *MeasurementSchema) AddTag(k string) {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	ms.TagKeys[k] = struct{}{}
+type Checkpoint struct {
+	DoneFiles   map[string]struct{} `json:"done_files"`
+	ProcessedAt time.Time           `json:"processed_at"`
 }
 
-func (ms *MeasurementSchema) AddFieldType(k string, t FieldType) {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	cur := ms.FieldKeys[k]
-	ms.FieldKeys[k] = promote(cur, t)
+func NewCheckpoint() *Checkpoint {
+	return &Checkpoint{
+		DoneFiles: make(map[string]struct{}),
+	}
 }
 
-// ---------- Global registry ----------
+type Row struct {
+	Measurement string
+	Timestamp   int64
+	Tags        map[string]string
+	Fields      map[string]interface{}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// CLI flags
+////////////////////////////////////////////////////////////////////////////////
 
 var (
-	schemasMu sync.Mutex
-	schemas   = make(map[string]*MeasurementSchema)
+	flTSMDir       = flag.String("tsm-dir", "", "TSM directory to read (required)")
+	flOut          = flag.String("out", "", "output sqlite file (required)")
+	flCheckpoint   = flag.String("checkpoint", "checkpoint.json", "checkpoint file path")
+	flWorkers      = flag.Int("workers", runtime.NumCPU(), "number of parallel readers")
+	flBatch        = flag.Int("batch", 1000, "sqlite insert batch size")
+	flMeasurements = flag.String("measurements", "", "comma separated measurements to include (optional)")
+	flStart        = flag.String("start", "", "start time RFC3339 or unix-ns (optional)")
+	flEnd          = flag.String("end", "", "end time RFC3339 or unix-ns (optional)")
+	flResume       = flag.Bool("resume", false, "resume from checkpoint file if present")
 )
 
-func getOrCreateSchema(m string) *MeasurementSchema {
-	schemasMu.Lock()
-	defer schemasMu.Unlock()
-	if s, ok := schemas[m]; ok {
-		return s
+////////////////////////////////////////////////////////////////////////////////
+// main
+////////////////////////////////////////////////////////////////////////////////
+
+func main() {
+	flag.Parse()
+	if *flTSMDir == "" || *flOut == "" {
+		flag.Usage()
+		os.Exit(2)
 	}
-	ns := NewMeasurementSchema(m)
-	schemas[m] = ns
-	return ns
+
+	ctx := context.Background()
+
+	var includeMeasurements map[string]struct{}
+	if *flMeasurements != "" {
+		includeMeasurements = make(map[string]struct{})
+		for _, m := range strings.Split(*flMeasurements, ",") {
+			includeMeasurements[strings.TrimSpace(m)] = struct{}{}
+		}
+	}
+
+	startTime, endTime, err := parseTimeRange(*flStart, *flEnd)
+	if err != nil {
+		log.Fatalf("invalid time range: %v", err)
+	}
+
+	log.Println("PASS 1: schema discovery")
+	schema, err := discoverSchema(ctx, *flTSMDir, includeMeasurements, startTime, endTime, *flWorkers)
+	if err != nil {
+		log.Fatalf("schema discovery failed: %v", err)
+	}
+	log.Printf("discovered %d measurements, %d unique tag keys\n", len(schema.Measurements), len(schema.TagKeys))
+
+	log.Println("prepare sqlite file:", *flOut)
+	db, err := sql.Open("sqlite3", *flOut)
+	if err != nil {
+		log.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if err := prepareSQLite(db, schema); err != nil {
+		log.Fatalf("prepare sqlite failed: %v", err)
+	}
+
+	cp := NewCheckpoint()
+	if *flResume {
+		if err := loadCheckpoint(*flCheckpoint, cp); err != nil {
+			log.Printf("warning: failed to load checkpoint (%v); starting fresh", err)
+		} else {
+			log.Printf("resuming: %d files already done", len(cp.DoneFiles))
+		}
+	}
+
+	log.Println("PASS 2: exporting data")
+	if err := exportData(ctx, *flTSMDir, schema, db, cp, *flCheckpoint, includeMeasurements, startTime, endTime, *flWorkers, *flBatch); err != nil {
+		log.Fatalf("export failed: %v", err)
+	}
+	log.Println("export complete")
 }
 
-// ---------- Helpers to parse series key ----------
-var seriesKeySplit = regexp.MustCompile(`,`) // simple split; tag values can contain commas escaped in Influx, adjust if needed
+////////////////////////////////////////////////////////////////////////////////
+// Time parsing
+////////////////////////////////////////////////////////////////////////////////
 
+func parseTimeRange(startStr, endStr string) (start, end *time.Time, err error) {
+	parse := func(s string) (*time.Time, error) {
+		if s == "" {
+			return nil, nil
+		}
+		// try RFC3339Nano
+		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			return &t, nil
+		}
+		// try RFC3339
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return &t, nil
+		}
+		// try integer nanoseconds
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			t := time.Unix(0, i)
+			return &t, nil
+		}
+		return nil, fmt.Errorf("can't parse time %q", s)
+	}
+	if startStr != "" {
+		s, e := parse(startStr)
+		if e != nil {
+			return nil, nil, e
+		}
+		start = s
+	}
+	if endStr != "" {
+		s, e := parse(endStr)
+		if e != nil {
+			return nil, nil, e
+		}
+		end = s
+	}
+	return start, end, nil
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Schema discovery (pass 1)
+////////////////////////////////////////////////////////////////////////////////
+
+func discoverSchema(ctx context.Context, tsmDir string, includeMeasurements map[string]struct{}, start, end *time.Time, workers int) (*Schema, error) {
+	schema := NewSchema()
+
+	// gather tsm files
+	files := []string{}
+	err := filepath.WalkDir(tsmDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".tsm") || strings.HasSuffix(d.Name(), ".tsm1") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		log.Println("warning: no tsm files found")
+	}
+
+	fileCh := make(chan string, len(files))
+	for _, f := range files {
+		fileCh <- f
+	}
+	close(fileCh)
+
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range fileCh {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if err := inspectTSMFileForSchema(f, schema, includeMeasurements, start, end); err != nil {
+					errCh <- fmt.Errorf("%s: %w", f, err)
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	if err, ok := <-errCh; ok {
+		return nil, err
+	}
+	return schema, nil
+}
 func parseSeriesKey(k string) (measurement string, tags map[string]string) {
 	tags = map[string]string{}
 	parts := strings.Split(k, ",")
@@ -140,558 +296,546 @@ func parseSeriesKey(k string) (measurement string, tags map[string]string) {
 	return
 }
 
-// ---------- Infer type from an interface{} value ----------
-func inferTypeFromValue(v interface{}) FieldType {
-	switch v := v.(type) {
-	case int, int8, int16, int32, int64:
-		return TypeInt64
-	case uint, uint8, uint16, uint32, uint64:
-		return TypeInt64
-	case float32, float64:
-		return TypeDouble
-	case bool:
-		return TypeBool
-	case string:
-		return TypeString
-	default:
-		// fallback: try to reflect / json decode -> string
-		_ = v
-		return TypeString
+func inspectTSMFileForSchema(filename string, schema *Schema, includeMeasurements map[string]struct{}, start, end *time.Time) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	reader, err := tsm1.NewTSMReader(f)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	iter := reader.BlockIterator()
+	for iter.Next() {
+		rawKey := iter.PeekNext()
+		serieKey, fieldKey := tsm1.SeriesAndFieldFromCompositeKey(rawKey)
+		field := string(fieldKey)
+		key := string(serieKey)
+		measurement, tagMap := parseSeriesKey(key)
+
+		if includeMeasurements != nil {
+			if _, ok := includeMeasurements[measurement]; !ok {
+				continue
+			}
+		}
+
+		// read some values to infer type
+		values, err := reader.ReadAll(rawKey)
+		if err != nil {
+			// skip this key on read error
+			continue
+		}
+
+		// Filter time range by checking if any value is inside range
+		insideRange := false
+		var observedType FieldType = FieldString // fallback
+		for _, v := range values {
+			ts := v.UnixNano()
+			if start != nil && time.Unix(0, ts).Before(*start) {
+				continue
+			}
+			if end != nil && time.Unix(0, ts).After(*end) {
+				continue
+			}
+			insideRange = true
+			switch v.Value().(type) {
+			case float64:
+				observedType = FieldFloat
+			case int64:
+				observedType = FieldInt
+			case bool:
+				observedType = FieldBool
+			case string:
+				observedType = FieldString
+			case []byte:
+				observedType = FieldString
+			default:
+				observedType = FieldString
+			}
+			// pick the most specific type if multiple values exist (if int and float both seen -> float)
+			// We'll scan all values but break once we see float as it's more general for numeric.
+			if observedType == FieldFloat {
+				break
+			}
+		}
+		if !insideRange {
+			continue
+		}
+
+		// update schema (thread-unsafe code can be called concurrently; protect with mutex?)
+		// In this function we may run concurrently from discoverSchema; simple approach:
+		// Acquire a package-level mutex? For simplicity here we update schema atomically via a mutex stored in the schema object.
+		// We'll embed a global mutex to protect these writes (defined below).
+		updateSchemaWithObservation(schema, measurement, field, observedType, tagMap)
+	}
+	// check iter.Err()
+	if err := iter.Err(); err != nil {
+		// some iterator errors aren't fatal; log and continue
+		// but return error to caller so discovery can be stopped if necessary
+		// we'll return nil to be tolerant
+		// return err
+	}
+	return nil
+}
+
+// schema mutex to safely update schema in concurrent discovery
+var schemaMu sync.Mutex
+
+func updateSchemaWithObservation(schema *Schema, measurement, fieldKey string, ft FieldType, tagMap map[string]string) {
+	schemaMu.Lock()
+	defer schemaMu.Unlock()
+	ms, ok := schema.Measurements[measurement]
+	if !ok {
+		ms = &MeasurementSchema{
+			FieldTypes: make(map[string]FieldType),
+			TagKeys:    make(map[string]struct{}),
+		}
+		schema.Measurements[measurement] = ms
+	}
+	// update field type using simple union rules: int+float -> float, else string dominates conflicts
+	if fieldKey != "" {
+		if existing, ok := ms.FieldTypes[fieldKey]; !ok {
+			ms.FieldTypes[fieldKey] = ft
+		} else {
+			if existing != ft {
+				// unify
+				if (existing == FieldInt && ft == FieldFloat) || (existing == FieldFloat && ft == FieldInt) {
+					ms.FieldTypes[fieldKey] = FieldFloat
+				} else {
+					// fallback to string for other conflicts
+					ms.FieldTypes[fieldKey] = FieldString
+				}
+			}
+		}
+	}
+	for k := range tagMap {
+		ms.TagKeys[k] = struct{}{}
+		schema.TagKeys[k] = struct{}{}
 	}
 }
 
-// ---------- PASS 1: schema discovery ----------
-func discoverSchemaFromTSMFile(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+////////////////////////////////////////////////////////////////////////////////
+// SQLite schema preparation
+////////////////////////////////////////////////////////////////////////////////
 
-	r, err := tsm1.NewTSMReader(file)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	iter := r.BlockIterator()
-	for iter.Next() {
-		keyByte := iter.PeekNext()
-		serieKey, fieldKey := tsm1.SeriesAndFieldFromCompositeKey(keyByte)
-		fieldString := string(fieldKey)
-		measurement, tags := parseSeriesKey(string(serieKey))
-		s := getOrCreateSchema(measurement)
-		// add tag keys
-		for tk := range tags {
-			s.AddTag(tk)
+func prepareSQLite(db *sql.DB, schema *Schema) error {
+	// derive global union of fields across measurements and unify types
+	fieldUnion := map[string]FieldType{}
+	for _, ms := range schema.Measurements {
+		for fk, ft := range ms.FieldTypes {
+			if ex, ok := fieldUnion[fk]; !ok {
+				fieldUnion[fk] = ft
+			} else if ex != ft {
+				// unify int+float -> float else string
+				if (ex == FieldInt && ft == FieldFloat) || (ex == FieldFloat && ft == FieldInt) {
+					fieldUnion[fk] = FieldFloat
+				} else {
+					fieldUnion[fk] = FieldString
+				}
+			}
 		}
-		// values contains points of different fields; sample them to infer field keys & types
-		values, err := r.ReadAll(keyByte)
+	}
+
+	// stable ordering for deterministic schema
+	tagKeys := make([]string, 0, len(schema.TagKeys))
+	for t := range schema.TagKeys {
+		tagKeys = append(tagKeys, t)
+	}
+	sort.Strings(tagKeys)
+
+	fieldKeys := make([]string, 0, len(fieldUnion))
+	for f := range fieldUnion {
+		fieldKeys = append(fieldKeys, f)
+	}
+	sort.Strings(fieldKeys)
+
+	// build CREATE TABLE
+	sb := strings.Builder{}
+	sb.WriteString("PRAGMA journal_mode=WAL;\n")
+	if _, err := db.Exec(sb.String()); err != nil {
+		// continue; not fatal
+	}
+	sb.Reset()
+	sb.WriteString("CREATE TABLE IF NOT EXISTS tsm_data (\n")
+	sb.WriteString("  measurement TEXT NOT NULL,\n")
+	sb.WriteString("  timestamp INTEGER NOT NULL,\n")
+	for i, t := range tagKeys {
+		col := fmt.Sprintf("tag_%s TEXT", sanitizeColName(t))
+		sb.WriteString("  " + col)
+		if i < len(tagKeys)-1 || len(fieldKeys) > 0 {
+			sb.WriteString(",\n")
+		} else {
+			sb.WriteString("\n")
+		}
+	}
+	for i, f := range fieldKeys {
+		ft := fieldUnion[f]
+		col := fmt.Sprintf("%s %s", sanitizeColName(f)+ft.Suffix(), sqlTypeForField(ft))
+		sb.WriteString("  " + col)
+		if i < len(fieldKeys)-1 {
+			sb.WriteString(",\n")
+		} else {
+			sb.WriteString("\n")
+		}
+	}
+	sb.WriteString(");")
+	createSQL := sb.String()
+	if _, err := db.Exec(createSQL); err != nil {
+		return fmt.Errorf("create table: %w\nsql=%s", err, createSQL)
+	}
+	return nil
+}
+
+func sanitizeColName(s string) string {
+	// replace non-alphanumerics with underscore, ensure doesn't start with digit
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			out = append(out, r)
+		} else {
+			out = append(out, '_')
+		}
+	}
+	if len(out) == 0 {
+		return "c"
+	}
+	if out[0] >= '0' && out[0] <= '9' {
+		return "c" + string(out)
+	}
+	return string(out)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Export data (pass 2)
+////////////////////////////////////////////////////////////////////////////////
+
+func exportData(ctx context.Context, tsmDir string, schema *Schema, db *sql.DB, cp *Checkpoint, checkpointPath string, includeMeasurements map[string]struct{}, start, end *time.Time, workers, batchSize int) error {
+	// collect files (skip done files)
+	files := []string{}
+	err := filepath.WalkDir(tsmDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			// What to do here ?
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".tsm") || strings.HasSuffix(d.Name(), ".tsm1") {
+			if cp != nil {
+				if _, done := cp.DoneFiles[path]; done {
+					return nil
+				}
+			}
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		log.Println("no files to process (maybe all done)")
+		return nil
+	}
+
+	// Build ordered lists for columns
+	tagKeys := make([]string, 0, len(schema.TagKeys))
+	for t := range schema.TagKeys {
+		tagKeys = append(tagKeys, t)
+	}
+	sort.Strings(tagKeys)
+	tagColNames := make([]string, len(tagKeys))
+	for i, t := range tagKeys {
+		tagColNames[i] = "tag_" + sanitizeColName(t)
+	}
+
+	// global field union & ordering
+	fieldUnion := map[string]FieldType{}
+	for _, ms := range schema.Measurements {
+		for fk, ft := range ms.FieldTypes {
+			if ex, ok := fieldUnion[fk]; !ok {
+				fieldUnion[fk] = ft
+			} else if ex != ft {
+				if (ex == FieldInt && ft == FieldFloat) || (ex == FieldFloat && ft == FieldInt) {
+					fieldUnion[fk] = FieldFloat
+				} else {
+					fieldUnion[fk] = FieldString
+				}
+			}
+		}
+	}
+	fieldKeys := make([]string, 0, len(fieldUnion))
+	for f := range fieldUnion {
+		fieldKeys = append(fieldKeys, f)
+	}
+	sort.Strings(fieldKeys)
+	fieldColNames := make([]string, len(fieldKeys))
+	for i, f := range fieldKeys {
+		fieldColNames[i] = sanitizeColName(f) + fieldUnion[f].Suffix()
+	}
+
+	// columns order
+	cols := []string{"measurement", "timestamp"}
+	cols = append(cols, tagColNames...)
+	cols = append(cols, fieldColNames...)
+
+	// prepare insert
+	placeholders := make([]string, len(cols))
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
+	insertSQL := fmt.Sprintf("INSERT INTO tsm_data (%s) VALUES (%s)", strings.Join(cols, ","), strings.Join(placeholders, ","))
+	stmt, err := db.Prepare(insertSQL)
+	if err != nil {
+		return fmt.Errorf("prepare insert: %w", err)
+	}
+	defer stmt.Close()
+
+	// channels
+	rowCh := make(chan Row, batchSize*workers*2)
+	errCh := make(chan error, workers+2)
+	var totalRows uint64
+
+	// progress bar
+	bar := progressbar.NewOptions(-1,
+		progressbar.OptionSetDescription("rows"),
+		progressbar.OptionSetWriter(os.Stdout),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSpinnerType(14),
+	)
+
+	// writer goroutine
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		batch := make([]Row, 0, batchSize)
+		commit := func(rows []Row) error {
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			for _, r := range rows {
+				args := make([]interface{}, 0, len(cols))
+				args = append(args, r.Measurement, r.Timestamp)
+				// tags
+				for _, tk := range tagKeys {
+					if v, ok := r.Tags[tk]; ok && v != "" {
+						args = append(args, v)
+					} else {
+						args = append(args, nil)
+					}
+				}
+				// fields
+				for _, fk := range fieldKeys {
+					if v, ok := r.Fields[fk]; ok {
+						args = append(args, v)
+					} else {
+						args = append(args, nil)
+					}
+				}
+				if _, err := tx.Stmt(stmt).Exec(args...); err != nil {
+					_ = tx.Rollback()
+					return err
+				}
+				atomic.AddUint64(&totalRows, 1)
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			for i := 0; i < len(rows); i++ {
+				_ = bar.Add(1)
+			}
+			return nil
 		}
 
-		for _, vv := range values {
-			// The exact API for vv may vary by Influx version.
-			// We expect vv.Field()/vv.Value()/vv.UnixNano() or similar.
-			// Try to use methods; if not available adapt here.
-			fieldName := fieldString
-			var v interface{}
-			// attempt to extract
-			// many versions expose vv.Field() or vv.FieldKey()
-			// try both via type assertions using reflection fallback
-			type fielder interface {
-				Field() string
-				Value() interface{}
+		flushTicker := time.NewTicker(2 * time.Second)
+		defer flushTicker.Stop()
+
+		for {
+			select {
+			case r, ok := <-rowCh:
+				if !ok {
+					if len(batch) > 0 {
+						if err := commit(batch); err != nil {
+							errCh <- err
+							return
+						}
+					}
+					return
+				}
+				batch = append(batch, r)
+				if len(batch) >= batchSize {
+					if err := commit(batch); err != nil {
+						errCh <- err
+						return
+					}
+					batch = batch[:0]
+				}
+			case <-flushTicker.C:
+				if len(batch) > 0 {
+					if err := commit(batch); err != nil {
+						errCh <- err
+						return
+					}
+					batch = batch[:0]
+				}
 			}
-			if f, ok := vv.(fielder); ok {
-				fieldName = f.Field()
-				v = f.Value()
-			} else {
-				// Fallback: try to parse key for field suffix after a separator
-				// NOTE: if this fallback is not correct for your Influx version, adapt here.
-				// For now, use a placeholder field name "value"
-				fieldName = fieldString
-				v = vv.Value()
+		}
+	}()
+
+	// readers
+	var readersWG sync.WaitGroup
+	fileCh := make(chan string, len(files))
+	for _, f := range files {
+		fileCh <- f
+	}
+	close(fileCh)
+
+	sem := make(chan struct{}, workers)
+	for i := 0; i < workers; i++ {
+		readersWG.Add(1)
+		go func(workerID int) {
+			defer readersWG.Done()
+			for f := range fileCh {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				log.Printf("[worker %d] processing file: %s", workerID, f)
+				if err := streamRowsFromFile(ctx, f, schema, rowCh, includeMeasurements, start, end); err != nil {
+					errCh <- fmt.Errorf("file %s: %w", f, err)
+					<-sem
+					return
+				}
+				<-sem
+				// mark file done & persist checkpoint
+				cp.DoneFiles[f] = struct{}{}
+				if err := saveCheckpoint(checkpointPath, cp); err != nil {
+					log.Printf("warning: failed to save checkpoint: %v", err)
+				}
 			}
-			ft := inferTypeFromValue(v)
-			s.AddFieldType(fieldName, ft)
+		}(i)
+	}
+
+	// wait for readers to finish, then close rowCh
+	go func() {
+		readersWG.Wait()
+		close(rowCh)
+	}()
+
+	// wait for writer or error
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		// wait for writer finish
+		writerWG.Wait()
+	}
+	log.Printf("exported rows: %d\n", atomic.LoadUint64(&totalRows))
+	return nil
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// streamRowsFromFile: read values and emit Row
+////////////////////////////////////////////////////////////////////////////////
+
+func streamRowsFromFile(ctx context.Context, filename string, schema *Schema, rowCh chan<- Row, includeMeasurements map[string]struct{}, start, end *time.Time) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	reader, err := tsm1.NewTSMReader(f)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	iter := reader.BlockIterator()
+	for iter.Next() {
+		rawKey := iter.PeekNext()
+		serieKey, fieldKey := tsm1.SeriesAndFieldFromCompositeKey(rawKey)
+		field := string(fieldKey)
+		key := string(serieKey)
+		measurement, tagMap := parseSeriesKey(key)
+
+		values, err := reader.ReadAll(rawKey)
+		if err != nil {
+			// skip on read error
+			continue
+		}
+		for _, v := range values {
+			ts := v.UnixNano()
+			if start != nil && time.Unix(0, ts).Before(*start) {
+				continue
+			}
+			if end != nil && time.Unix(0, ts).After(*end) {
+				continue
+			}
+			val := v.Value()
+			// coerce []byte -> string
+			switch vv := val.(type) {
+			case []byte:
+				val = string(vv)
+			}
+			row := Row{
+				Measurement: measurement,
+				Timestamp:   ts,
+				Tags:        tagMap,
+				Fields:      map[string]interface{}{field: val},
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case rowCh <- row:
+			}
 		}
 	}
 	if err := iter.Err(); err != nil {
 		// log and continue
-		log.Printf("discover: iterator error on %s: %v", path, err)
+		// return err
 	}
 	return nil
 }
 
-// ---------- Build Parquet schema (Parquet thrift/JSON schema string) ----------
-func buildParquetSchema(ms *MeasurementSchema) string {
-	var fields []map[string]interface{}
+////////////////////////////////////////////////////////////////////////////////
+// Checkpoint utilities
+////////////////////////////////////////////////////////////////////////////////
 
-	// timestamp column
-	fields = append(fields, map[string]interface{}{
-		"Tag": "name=timestamp, type=INT64, convertedtype=TIMESTAMP_MILLIS, repetitiontype=REQUIRED",
-	})
-
-	// tags as optional UTF8 strings
-	tagList := make([]string, 0, len(ms.TagKeys))
-	for k := range ms.TagKeys {
-		tagList = append(tagList, k)
-	}
-	sort.Strings(tagList)
-	for _, k := range tagList {
-		fields = append(fields, map[string]interface{}{
-			"Tag": fmt.Sprintf("name=%s, type=BYTE_ARRAY, convertedtype=UTF8, repetitiontype=OPTIONAL", parquetColName(k)),
-		})
-	}
-
-	fieldList := make([]string, 0, len(ms.FieldKeys))
-	for k := range ms.FieldKeys {
-		fieldList = append(fieldList, k)
-	}
-	sort.Strings(fieldList)
-	// fields with proper type mapping
-	for _, k := range fieldList {
-		colName := parquetColName(k)
-		ft := ms.FieldKeys[k]
-
-		var tag string
-		switch ft {
-		case TypeInt64:
-			tag = fmt.Sprintf("name=%s, type=INT64, repetitiontype=OPTIONAL", colName)
-		case TypeDouble:
-			tag = fmt.Sprintf("name=%s, type=DOUBLE, repetitiontype=OPTIONAL", colName)
-		case TypeBool:
-			tag = fmt.Sprintf("name=%s, type=BOOLEAN, repetitiontype=OPTIONAL", colName)
-		default:
-			tag = fmt.Sprintf("name=%s, type=BYTE_ARRAY, convertedtype=UTF8, repetitiontype=OPTIONAL", colName)
-		}
-
-		fields = append(fields, map[string]interface{}{"Tag": tag})
-	}
-
-	// the JSONWriter expects this shape:
-	// {"Tag":"name=parquet-go-root","Fields":[ {...}, {...}, ... ]}
-	root := map[string]interface{}{
-		"Tag":    "name=parquet-go-root",
-		"Fields": fields,
-	}
-
-	jsonBytes, _ := json.Marshal(root)
-	return string(jsonBytes)
-}
-
-// safe column name: replace non-word chars with underscore
-var nonWord = regexp.MustCompile(`\W+`)
-
-func parquetColName(k string) string {
-	s := nonWord.ReplaceAllString(k, "_")
-	if s == "" {
-		s = "col"
-	}
-	// avoid leading digit
-	if s[0] >= '0' && s[0] <= '9' {
-		s = "c_" + s
-	}
-	return s
-}
-
-// ---------- Writer goroutine per measurement ----------
-type writerMsg struct {
-	row map[string]interface{}
-}
-
-type measurementWriter struct {
-	measurement string
-	schemaStr   string
-
-	outDir string
-
-	queue chan writerMsg
-
-	// rotation
-	maxRows int64
-	curRows int64
-	fileIdx int64
-
-	// parquet objects
-	pw   *parquetWritter.ParquetWriter
-	fw   source.ParquetFile
-	lock sync.Mutex
-}
-
-func newMeasurementWriter(measurement string, schemaStr string, outDir string, maxRows int64) *measurementWriter {
-	mw := &measurementWriter{
-		measurement: measurement,
-		schemaStr:   schemaStr,
-		outDir:      outDir,
-		queue:       make(chan writerMsg, WriterQueueLen),
-		maxRows:     maxRows,
-		curRows:     0,
-		fileIdx:     0,
-	}
-	go mw.run()
-	return mw
-}
-
-func (mw *measurementWriter) enqueue(row map[string]interface{}) {
-	mw.queue <- writerMsg{row: row}
-}
-
-func (mw *measurementWriter) rotate() error {
-	// close existing
-	mw.lock.Lock()
-	defer mw.lock.Unlock()
-
-	if mw.pw != nil {
-		if err := mw.pw.WriteStop(); err != nil {
-			log.Printf("parquet WriteStop error: %v", err)
-		}
-		if mw.fw != nil {
-			_ = mw.fw.Close()
-		}
-		mw.pw = nil
-		mw.fw = nil
-	}
-
-	// increment fileIdx
-	mw.fileIdx++
-	fileName := fmt.Sprintf("%s_%06d.parquet", sanitizeFileName(mw.measurement), mw.fileIdx)
-	full := filepath.Join(mw.outDir, fileName)
-
-	fw, err := local.NewLocalFileWriter(full)
-	if err != nil {
-		return err
-	}
-	println("Creating new JSONWriter")
-	println("Schema is", mw.schemaStr)
-
-	pw, err := parquetWritter.NewParquetWriter(fw, mw.schemaStr, 4)
-	if err != nil {
-		_ = fw.Close()
-		return err
-	}
-	// set compression
-	pw.CompressionType = parquet.CompressionCodec_SNAPPY
-
-	mw.fw = fw
-	mw.pw = pw
-	mw.curRows = 0
-	log.Printf("Started new parquet for %s -> %s", mw.measurement, full)
-	return nil
-}
-
-func sanitizeFileName(s string) string {
-	return strings.ReplaceAll(s, string(os.PathSeparator), "_")
-}
-
-func (mw *measurementWriter) run() {
-	// create first file
-	if err := os.MkdirAll(mw.outDir, 0755); err != nil {
-		log.Fatalf("mkdir output: %v", err)
-	}
-	if err := mw.rotate(); err != nil {
-		log.Fatalf("failed to open parquet for %s: %v", mw.measurement, err)
-	}
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case msg, ok := <-mw.queue:
-			if !ok {
-				// flush and close
-				_ = mw.rotate() // ensures writer closed
-				return
-			}
-			mw.lock.Lock()
-			// write row as JSON map
-			if mw.pw == nil {
-				_ = mw.rotate()
-			}
-
-			if err := mw.pw.Write(msg.row); err != nil {
-				log.Printf("parquet write error for %s: %v", mw.measurement, err)
-				log.Printf("Data was %v", msg.row)
-				log.Fatalf("Stop here !")
-			} else {
-				mw.curRows++
-				if mw.curRows >= mw.maxRows {
-					// rotate
-					if err := mw.rotate(); err != nil {
-						log.Printf("rotate error %v", err)
-					}
-				}
-			}
-			mw.lock.Unlock()
-		case <-ticker.C:
-			// periodic flush not strictly necessary; JSONWriter writes directly
-		}
-	}
-}
-
-// ---------- Global writers registry ----------
-
-var (
-	writersMu sync.Mutex
-	writers   = make(map[string]*measurementWriter)
-)
-
-func getWriterForMeasurement(measurement string, schemaStr string, outDir string) *measurementWriter {
-	writersMu.Lock()
-	defer writersMu.Unlock()
-	if w, ok := writers[measurement]; ok {
-		return w
-	}
-	w := newMeasurementWriter(measurement, schemaStr, outDir, int64(MaxRowsPerFile))
-	writers[measurement] = w
-	return w
-}
-
-func closeAllWriters() {
-	writersMu.Lock()
-	defer writersMu.Unlock()
-	for _, w := range writers {
-		close(w.queue)
-	}
-}
-
-// ---------- PASS 2: stream values to writers ----------
-func processTSMFileStream(path string, outDir string) error {
+func loadCheckpoint(path string, cp *Checkpoint) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	r, err := tsm1.NewTSMReader(f)
+	return json.NewDecoder(f).Decode(cp)
+}
+
+func saveCheckpoint(path string, cp *Checkpoint) error {
+	cp.ProcessedAt = time.Now().UTC()
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer r.Close()
-
-	iter := r.BlockIterator()
-	for iter.Next() {
-		keyByte := iter.PeekNext()
-		serieKey, fieldKey := tsm1.SeriesAndFieldFromCompositeKey(keyByte)
-		field := string(fieldKey)
-		key := string(serieKey)
-		measurement, tags := parseSeriesKey(key)
-		ms := getOrCreateSchema(measurement)
-		// build a column name list (order doesn't matter for JSON writer)
-		// create schema string if not already created (we build per measurement once)
-		// first-time schemaStr creation:
-		schemasMu.Lock()
-		// ensure deterministic column ordering
-		schemaStr := buildParquetSchema(ms)
-		schemasMu.Unlock()
-
-		writer := getWriterForMeasurement(measurement, schemaStr, outDir)
-		values, err := r.ReadAll(keyByte)
-		if err != nil {
-			return err
-		}
-		for _, vv := range values {
-			// extract field, value, timestamp
-			var fieldName string
-			var val interface{}
-			var unixNano int64
-
-			// try interface extraction
-			type vIface interface {
-				Field() string
-				Value() interface{}
-				UnixNano() int64
-			}
-			if vf, ok := vv.(vIface); ok {
-				fieldName = vf.Field()
-				val = vf.Value()
-				unixNano = vf.UnixNano()
-			} else {
-				// fallback: call available methods or functions
-				// IMPORTANT: adapt here if your tsm value type differs
-				fieldName = field
-				// try to call Value() and UnixNano() via reflection is possible, but we assume Value method exists
-				type v2 interface {
-					Value() interface{}
-					UnixNano() int64
-				}
-				if v2f, ok2 := vv.(v2); ok2 {
-					val = v2f.Value()
-					unixNano = v2f.UnixNano()
-				} else {
-					// as last fallback, skip
-					println("WARN: Could not extract value of values")
-					continue
-				}
-			}
-
-			// Build row map: timestamp (millis), tag columns, field column
-			row := make(map[string]interface{})
-			row["timestamp"] = unixNano
-
-			// tags: ensure presence of all tag keys even if nil is okay for writer
-			ms.mu.Lock()
-			for tk := range ms.TagKeys {
-				col := parquetColName(tk)
-				if tv, ok := tags[tk]; ok {
-					row[col] = tv
-				} else {
-					row[col] = nil
-				}
-			}
-			// fields: ensure all field keys present; others nil
-			for fk := range ms.FieldKeys {
-				col := parquetColName(fk)
-				if fk == fieldName {
-					// convert val to one of the supported types (int64, float64, bool, string)
-					switch vv := val.(type) {
-					case int:
-						row[col] = int64(vv)
-					case int8:
-						row[col] = int64(vv)
-					case int16:
-						row[col] = int64(vv)
-					case int32:
-						row[col] = int64(vv)
-					case int64:
-						row[col] = vv
-					case uint, uint8, uint16, uint32, uint64:
-						row[col] = int64(reflectToInt64(vv))
-					case float32:
-						row[col] = float64(vv)
-					case float64:
-						row[col] = vv
-					case bool:
-						row[col] = vv
-					case string:
-						row[col] = vv
-					default:
-						// as fallback convert to string
-						row[col] = fmt.Sprintf("%v", vv)
-					}
-				} else {
-					// other fields for this timestamp: null
-					row[col] = nil
-				}
-			}
-			ms.mu.Unlock()
-
-			// enqueue
-			writer.enqueue(row)
-		}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(cp); err != nil {
+		_ = f.Close()
+		return err
 	}
-	if err := iter.Err(); err != nil {
-		log.Printf("stream: iterator err %v", err)
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
 	}
-	return nil
-}
-
-func reflectToInt64(v interface{}) int64 {
-	switch vv := v.(type) {
-	case uint:
-		return int64(vv)
-	case uint8:
-		return int64(vv)
-	case uint16:
-		return int64(vv)
-	case uint32:
-		return int64(vv)
-	case uint64:
-		return int64(vv)
-	default:
-		return 0
+	if err := f.Close(); err != nil {
+		return err
 	}
-}
-
-// ---------- Utility: collect all .tsm files under a dir ----------
-func collectTSMFiles(root string) ([]string, error) {
-	var out []string
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// continue
-			return nil
-		}
-		if info.IsDir() {
-			return nil
-		}
-		if strings.HasSuffix(path, ".tsm") {
-			out = append(out, path)
-		}
-		return nil
-	})
-	return out, err
-}
-
-// ---------- Main ----------
-func usage() {
-	fmt.Printf("Usage: %s <tsm_dir> <output_dir>\n", os.Args[0])
-	fmt.Printf("Config: MaxRowsPerFile=%d, ParallelReaders=%d\n", MaxRowsPerFile, ParallelReaders)
-}
-
-func main() {
-	if len(os.Args) < 3 {
-		usage()
-		os.Exit(1)
-	}
-	tsmDir := os.Args[1]
-	outDir := os.Args[2]
-
-	files, err := collectTSMFiles(tsmDir)
-	if err != nil {
-		log.Fatalf("collectTSMFiles: %v", err)
-	}
-	log.Printf("Found %d tsm files", len(files))
-
-	// PASS 1: schema discovery
-	log.Printf("PASS 1: schema discovery (this should be fast compared to full export)")
-	fileCh := make(chan string, 1024)
-	var wg sync.WaitGroup
-	for i := 0; i < ParallelReaders; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for p := range fileCh {
-				if err := discoverSchemaFromTSMFile(p); err != nil {
-					log.Printf("schema discover error %s: %v", p, err)
-				}
-			}
-		}()
-	}
-	for _, f := range files {
-		fileCh <- f
-	}
-	close(fileCh)
-	wg.Wait()
-
-	// After discovery, print summary and build per-measurement schema strings (and show counts)
-	log.Printf("Schema discovery complete. Measurements: %d", len(schemas))
-	for m, s := range schemas {
-		log.Printf("Measurement=%s tags=%d fields=%d", m, len(s.TagKeys), len(s.FieldKeys))
-	}
-
-	// PASS 2: streaming export
-	log.Printf("PASS 2: streaming export")
-	fileCh2 := make(chan string, 1024)
-	var wg2 sync.WaitGroup
-	for i := 0; i < ParallelReaders; i++ {
-		wg2.Add(1)
-		go func() {
-			defer wg2.Done()
-			for p := range fileCh2 {
-				if err := processTSMFileStream(p, outDir); err != nil {
-					log.Printf("streaming error %s: %v", p, err)
-				}
-			}
-		}()
-	}
-	for _, f := range files {
-		fileCh2 <- f
-	}
-	close(fileCh2)
-	wg2.Wait()
-
-	// close and flush writers
-	closeAllWriters()
-
-	log.Printf("Done export.")
+	return os.Rename(tmp, path)
 }
