@@ -42,5 +42,10 @@ Then you can buil the tool
 go build ./src/main.go
 ```
 
+# Example how to run 
+
+```bash
+go run src/main.go -tsm-dir /Users/user1/podman-data/podman-data/influx/data -out ./dataTest/data2.db -workers 4 -batch 50000 -checkpoint ./dataTest/checkpoint.json
+```
 
 
